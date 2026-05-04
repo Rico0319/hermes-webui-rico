@@ -1,5 +1,3 @@
----
-
 ## Quick start
 
 Run the repo bootstrap:
