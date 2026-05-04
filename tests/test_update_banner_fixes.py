@@ -46,13 +46,13 @@ class TestUpdateChecker:
             if args[:2] == ['rev-parse', '--short']:
                 return 'abcdef1', True
             if args[:2] == ['remote', 'get-url']:
-                return 'https://github.com/nesquena/hermes-webui.git', True
+                return 'https://github.com/Rico0319/hermes-webui-rico.git', True
             return '', True
 
         monkeypatch.setattr(upd, '_run_git', fake_run)
         result = upd._check_repo(tmp_path, 'webui')
 
-        assert result['repo_url'] == 'https://github.com/nesquena/hermes-webui'
+        assert result['repo_url'] == 'https://github.com/Rico0319/hermes-webui-rico'
 
     def test_repo_url_converts_ssh_and_strips_only_dot_git_suffix(self, tmp_path, monkeypatch):
         import api.updates as upd
@@ -71,13 +71,13 @@ class TestUpdateChecker:
             if args[:2] == ['rev-parse', '--short']:
                 return 'abcdef1', True
             if args[:2] == ['remote', 'get-url']:
-                return 'git@github.com:NousResearch/hermes-agent.git', True
+                return 'git@github.com:Rico0319/hermes-rico.git', True
             return '', True
 
         monkeypatch.setattr(upd, '_run_git', fake_run)
         result = upd._check_repo(tmp_path, 'agent')
 
-        assert result['repo_url'] == 'https://github.com/NousResearch/hermes-agent'
+        assert result['repo_url'] == 'https://github.com/Rico0319/hermes-rico'
 
 
 class TestConflictError:

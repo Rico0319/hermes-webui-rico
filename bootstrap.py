@@ -17,7 +17,7 @@ import webbrowser
 from pathlib import Path
 
 
-INSTALLER_URL = "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh"
+INSTALLER_URL = "https://raw.githubusercontent.com/Rico0319/hermes-rico/main/scripts/install.sh"
 REPO_ROOT = Path(__file__).resolve().parent
 
 
@@ -218,6 +218,40 @@ def install_hermes_agent() -> None:
     )
 
 
+def check_hermes_agent_installed() -> None:
+    """Verify Hermes Agent is installed. Fail with clear instructions if not.
+
+    The WebUI requires Hermes Agent to be installed first. We do NOT auto-install
+    because the user should consciously choose to install the agent, and the
+    installer may require interactive setup (API keys, etc.).
+    """
+    agent_dir = discover_agent_dir()
+    has_hermes_cmd = hermes_command_exists()
+
+    if agent_dir or has_hermes_cmd:
+        return
+
+    raise RuntimeError(
+        "\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  Hermes Agent is NOT installed\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\n"
+        "The WebUI requires Hermes Agent to be installed first.\n"
+        "\n"
+        "Install it with:\n"
+        "  curl -fsSL https://raw.githubusercontent.com/Rico0319/hermes-rico/main/scripts/install.sh | bash\n"
+        "\n"
+        "Or clone and install manually:\n"
+        "  git clone https://github.com/Rico0319/hermes-rico.git ~/.hermes/hermes-agent\n"
+        "  cd ~/.hermes/hermes-agent\n"
+        "  ./scripts/install.sh\n"
+        "\n"
+        "After installation, re-run this bootstrap.\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    )
+
+
 def wait_for_health(url: str, timeout: float = 25.0) -> bool:
     deadline = time.time() + timeout
     # Validate URL scheme to prevent file:// and other dangerous schemes
@@ -250,9 +284,9 @@ def parse_args() -> argparse.Namespace:
         help="Do not open a browser tab automatically.",
     )
     parser.add_argument(
-        "--skip-agent-install",
+        "--skip-agent-check",
         action="store_true",
-        help="Fail instead of attempting the official Hermes installer.",
+        help="Skip the Hermes Agent installation check (not recommended).",
     )
     parser.add_argument(
         "--foreground",
@@ -336,12 +370,9 @@ def main() -> int:
     ensure_supported_platform()
 
     agent_dir = discover_agent_dir()
-    if not agent_dir and not hermes_command_exists():
-        if args.skip_agent_install:
-            raise RuntimeError(
-                "Hermes Agent was not found and auto-install was disabled."
-            )
-        install_hermes_agent()
+    if not args.skip_agent_check:
+        check_hermes_agent_installed()
+        # Re-discover after the check (in case the user installed it between reading the error and re-running)
         agent_dir = discover_agent_dir()
 
     python_exe = ensure_python_has_webui_deps(discover_launcher_python(agent_dir), agent_dir)

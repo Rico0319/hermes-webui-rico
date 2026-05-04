@@ -346,7 +346,7 @@ else
     echo "!! To fix: mount the agent source volume into the container:"
     echo "!!   -v /path/to/hermes-agent:/home/hermeswebui/.hermes/hermes-agent"
     echo "!! Or see the two-container compose example:"
-    echo "!!   https://github.com/nesquena/hermes-webui/blob/master/docker-compose.two-container.yml"
+    echo "!!   https://github.com/Rico0319/hermes-webui-rico/blob/master/docker-compose.two-container.yml"
     echo ""
   fi
   touch /app/venv/.deps_installed

@@ -9,14 +9,14 @@ This is the comprehensive Docker reference. For a 5-minute quickstart, see the [
 | **Single-container** (recommended) | You just want chat working. WebUI runs the agent in-process. | `docker-compose.yml` |
 | **Two-container** | You want isolation between gateway (CLI/Telegram/cron) and chat UI. | `docker-compose.two-container.yml` |
 | **Three-container** | Two-container PLUS the dashboard for monitoring. | `docker-compose.three-container.yml` |
-| **All-in-one image** (community fork — third-party, not maintained by us) | Podman 3.4 / multi-arch / supervisord-style preference. | [sunnysktsang/hermes-suite](https://github.com/sunnysktsang/hermes-suite) — see [#1399](https://github.com/nesquena/hermes-webui/issues/1399) for the original discussion |
+| **All-in-one image** (community fork — third-party, not maintained by us) | Podman 3.4 / multi-arch / supervisord-style preference. | [sunnysktsang/hermes-suite](https://github.com/sunnysktsang/hermes-suite) — see [#1399](https://github.com/Rico0319/hermes-webui-rico/issues/1399) for the original discussion |
 
 If something stops working, **start with the single-container setup** — it's the simplest path and fixes most permission/UID/path-mismatch issues by construction.
 
 ## 5-minute quickstart (single container)
 
 ```bash
-git clone https://github.com/nesquena/hermes-webui
+git clone https://github.com/Rico0319/hermes-webui-rico
 cd hermes-webui
 cp .env.docker.example .env
 # Edit .env if needed (most users can skip this on Linux)
@@ -194,7 +194,7 @@ volumes:
 - #668 — auto-detect UID/GID from mounted volume
 - #569 — UID/GID detection priority order
 
-If you hit a new failure mode not covered here, please [open an issue](https://github.com/nesquena/hermes-webui/issues/new) with:
+If you hit a new failure mode not covered here, please [open an issue](https://github.com/Rico0319/hermes-webui-rico/issues/new) with:
 
 1. Which compose file you used
 2. The error from `docker logs hermes-webui`
