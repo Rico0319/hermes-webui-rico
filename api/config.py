@@ -199,11 +199,37 @@ def _get_config_path() -> Path:
         return HOME / ".hermes" / "config.yaml"
 
 
+_WEBUI_SESSION_SAVE_MODES = {"deferred", "eager"}
+_DEFAULT_WEBUI_SESSION_SAVE_MODE = "deferred"
+
+
 def get_config() -> dict:
     """Return the cached config dict, loading from disk if needed."""
     if not _cfg_cache:
         reload_config()
     return _cfg_cache
+
+
+def get_webui_session_save_mode(config_data: dict | None = None) -> str:
+    """Return the validated first-turn session persistence mode.
+
+    ``deferred`` preserves the current first-turn sidecar behaviour: persist
+    pending_user_message/runtime fields before streaming, then merge the turn
+    after the agent finishes. ``eager`` additionally checkpoints the current
+    user turn into ``messages`` before launching the agent thread. Unknown
+    values fail closed to ``deferred`` so a typo never reintroduces eager disk
+    writes unexpectedly.
+    """
+    active_cfg = config_data if isinstance(config_data, dict) else cfg
+    webui_cfg = active_cfg.get("webui", {}) if isinstance(active_cfg, dict) else {}
+    if not isinstance(webui_cfg, dict):
+        return _DEFAULT_WEBUI_SESSION_SAVE_MODE
+    mode = webui_cfg.get("session_save_mode", _DEFAULT_WEBUI_SESSION_SAVE_MODE)
+    if isinstance(mode, str):
+        normalized = mode.strip().lower()
+        if normalized in _WEBUI_SESSION_SAVE_MODES:
+            return normalized
+    return _DEFAULT_WEBUI_SESSION_SAVE_MODE
 
 
 def reload_config() -> None:
@@ -2524,6 +2550,20 @@ def get_available_models() -> dict:
             for pid in sorted(detected_providers):
                 if pid.startswith("custom:") and pid in _named_custom_groups:
                     _nc_display, _nc_models = _named_custom_groups[pid]
+                    # If all named-group models were deduped (already auto-detected
+                    # from base_url /v1/models), fall back to auto-detected models
+                    # instead of silently dropping the group (issue #1619).
+                    #
+                    # Per Opus advisor on stage-295: the load-bearing fix for the
+                    # reporter's symptom is the api/routes.py:/api/models/live
+                    # broadening to handle custom:* slugs. This block is defensive
+                    # belt-and-braces — under current _named_custom_groups
+                    # population logic (atomic add+append inside the same dedup
+                    # guard at line ~2640), an empty list shouldn't reach here.
+                    # Kept for future-proofing in case the population logic
+                    # changes (e.g. supporting model-less custom_providers entries).
+                    if not _nc_models:
+                        _nc_models = auto_detected_models_by_provider.get(pid, [])
                     if _nc_models:
                         groups.append({"provider": _nc_display, "provider_id": pid, "models": _nc_models})
                     continue
@@ -3068,6 +3108,7 @@ _SETTINGS_DEFAULTS = {
     "onboarding_completed": False,
     "send_key": "enter",  # 'enter' or 'ctrl+enter'
     "show_token_usage": False,  # show input/output token badge below assistant messages
+    "show_tps": False,  # show tokens-per-second chip in assistant message headers
     "show_cli_sessions": False,  # merge CLI sessions from state.db into the sidebar
     "sync_to_insights": False,  # mirror WebUI token usage to state.db for /insights
     "check_for_updates": True,  # check if webui/agent repos are behind upstream
@@ -3193,6 +3234,7 @@ _SETTINGS_ENUM_VALUES = {
 _SETTINGS_BOOL_KEYS = {
     "onboarding_completed",
     "show_token_usage",
+    "show_tps",
     "show_cli_sessions",
     "sync_to_insights",
     "check_for_updates",

@@ -1,5 +1,126 @@
 # Hermes Web UI -- Changelog
 
+## [v0.50.297] — 2026-05-04
+
+### Fixed (3 PRs — closes #1658; refs #1458, #1652)
+
+- **Docker container no longer enters a crash loop on every normal Docker setup** (#1659 by @bergeouss, closes #1658) — PR #1635 (v0.50.295) added a writability guard `[ ! -w /etc/group ] || [ ! -w /etc/passwd ]` for podman `read_only=true` containers. Bug: the script runs as the non-root `hermeswebuitoo` user, so `/etc/group` (owned by root) is **always** non-writable from that user — guard fires on EVERY normal Docker setup, container enters a crash loop with `!! ERROR: Cannot modify /etc/group or /etc/passwd (read-only root fs)`. Affects all users running standard Docker after upgrading to v0.50.295. **Fix:** replace `[ ! -w ]` with `! sudo sh -c 'test -w /etc/group && test -w /etc/passwd' 2>/dev/null` — matches the fact that `groupmod`/`usermod` already use sudo a few lines below. Truly read-only rootfs (podman) → sudo can't write → guard fires correctly. Writable rootfs (normal Docker) → sudo can write → guard doesn't fire → groupmod/usermod runs normally. **3 LOC `docker_init.bash` change.** P0 regression fix.
+
+- **OAuth Cancel during Codex device-token exchange now wins the race** (#1653 by @nesquena, follow-up to #1652 / refs #1362) — race in v0.50.296's Codex OAuth onboarding flow where a `POST /api/onboarding/oauth/cancel` arriving while the worker was mid-network-call would be silently overridden: credentials would still get persisted to `auth.json` and the flow status would flip from `cancelled` → `success`. Net effect: the user's explicit cancel was ignored, credentials persisted, UI reported success. **Fix:** re-check `_OAUTH_FLOWS[flow_id].status` under `_OAUTH_FLOWS_LOCK` immediately AFTER `_exchange_codex_authorization()` returns and BEFORE writing `auth.json`. If status is no longer `pending`, return cleanly — no persistence, no status overwrite. Behavioral test using `threading.Event` deterministically reproduces the race. UX-inconsistency severity, not a security bug (the credentials that get persisted ARE tokens the user authorized in their browser), but the cancel button stops doing what it says, violating the design intent of #1650's server-owned lifecycle.
+
+- **Persistent-host health diagnostics + watchdog hardening** (#1657 by @Michaelyklam, refs #1458) — addresses the residual #1458 Bug #3 failure mode (process alive + port listening but HTTP requests not advancing), the wedge that survives after v0.50.275's FD-leak fix and v0.50.269's bootstrap fix. Adds three signals process supervisors can use to distinguish "process exists" from "request handling is still advancing":
+  - **Accept-loop heartbeat**: `QuietHTTPServer.accept_loop_requests_total` + `accept_loop_last_request_at` instance attributes, incremented in `_handle_request_noblock()` (single `serve_forever()` thread, un-locked `+=` is safe). Surfaced in `/health` as `accept_loop: {requests_total, last_request_at}`.
+  - **`/health?deep=1` readiness probe**: bounded `STREAMS_LOCK.acquire(timeout=0.5)` + `all_sessions()` walk + `load_projects(_migrate=False)` + `sqlite3.connect(state.db) + PRAGMA schema_version`. Returns 503 with `status: degraded` when streams lock blocks or any deep check errors. Watchdogs polling `/health?deep=1` every 30s open-and-close 2880 short-lived sqlite connections per day per probe — bounded FD usage, no leak surface.
+  - **`RLIMIT_NOFILE` raise to 4096** at startup (best-effort, defense in depth for macOS launchd jobs that start at 256). Doesn't hide future FD leaks; gives diagnostic headroom before request handling falls over.
+  - **`docs/supervisor.md` updates**: launchd/systemd HTTP watchdog recipe using `curl -fsS --max-time 10 /health?deep=1` + `launchctl kickstart -k`. Notes `accept_loop.requests_total` should advance — if it stays flat while the process is alive, the accept loop is wedged.
+
+  Per Opus advisor on stage-297: refactored `_deep_health_checks(stream_check=...)` to accept the pre-computed stream check from `_handle_health()` so we don't acquire `STREAMS_LOCK` twice on the same `/health?deep=1` request (cosmetic inefficiency, not a correctness bug — but also could false-fail when the second acquire times out under contention). Plus a docstring note on `_handle_request_noblock` documenting why the un-locked `+=` is safe (single-thread-only call site in CPython socketserver).
+
+  PR #1656 by the same author (smaller, module-level globals approach) was closed as superseded by #1657 (instance-level + state.db check + projects check + supervisor.md docs).
+
+### Tests
+
+4284 → **4288 passing** (+4 regression tests across `tests/test_issue1458_stability_hardening.py` (3) + `tests/test_issue1362_codex_oauth_onboarding.py::test_cancel_during_token_exchange_does_not_persist_credentials` (1)). 0 regressions. Full suite ~118s.
+
+### Pre-release verification
+
+- **Opus advisor on stage-297 combined diff: SHIP verdict.** All 9 verification questions cleared:
+  - `_active_state_db_path()` verified at `api/models.py:924`, returns Path without opening connection
+  - 500ms `STREAMS_LOCK.acquire(timeout=...)` ceiling reasonable for watchdog timeouts (10s curl `--max-time` typical)
+  - `with closing(sqlite3.connect(...))` deterministically releases FD, `PRAGMA schema_version` is read-only
+  - `_handle_request_noblock` heartbeat increment is BEFORE super() — counter advances even if request handling raises, correct accept-loop semantics
+  - `_raise_fd_soft_limit()` correctly clamps to hard limit, only RAISES soft limit (won't lower below launchd's `LimitNOFILE` setting)
+  - OAuth fix narrows race window from "seconds-long network call" to "microseconds-long file write" — minimal correct change at the right layer
+  - Docker fix `sudo sh -c 'test -w'` correctly handles all 3 cases (writable+sudo / readonly+sudo / no-sudo)
+- **Two minor Opus follow-ups absorbed in-release**:
+  - `_deep_health_checks(stream_check=...)` reuses pre-computed stream check from `_handle_health()` — saves redundant lock acquisition
+  - Docstring note on `_handle_request_noblock` documenting single-thread safety of un-locked `+=`
+- **Self-built #1653** has thorough `threading.Event`-gated behavioral test demonstrating the race exists pre-fix and is fixed post-fix.
+- **Browser API sanity**: 11/11 endpoints OK on stage server.
+- **Conflict resolution**: zero file overlap across all 3 PRs (#1659 → docker_init.bash; #1653 → api/oauth.py; #1657 → api/routes.py + server.py + docs/supervisor.md). Auto-merged clean.
+
+### Authors
+
+- @bergeouss — 1 PR (#1659, AI-assisted via Hermes Agent) — fixing their own v0.50.295 #1635 regression
+- @nesquena (self-built) — 1 PR (#1653, follow-up to v0.50.296 #1652)
+- @Michaelyklam — 1 PR (#1657, hardening for #1458 Bug #3)
+
+### Note on closed-as-superseded
+
+PR #1656 (also @Michaelyklam) was closed as superseded by #1657. Both target #1458 Bug #3, both add accept-loop heartbeat + `/health?deep=1` + 503-on-degraded. #1657 adds beyond #1656: state.db connectivity check, projects state check, FD soft-limit raise, and `docs/supervisor.md` watchdog recipe. Same author iterated; the second PR was the keeper.
+
+## [v0.50.296] — 2026-05-04
+
+### Fixed (3 PRs — closes #1406, #1617; refs #1362)
+
+- **Per-turn TPS now visible in assistant message headers (default-off, opt-in via Preferences)** (#1640 by @Michaelyklam, closes #1617) — UX gate **APPROVED by @aronprins** with default-off + opt-in setting addition. Previously `_turnTps` calculation existed in `api/streaming.py` but was rendered into a global titlebar `tpsStat` element that's been hidden by default since v0.50.x. New `show_tps` boolean setting in Preferences (default `false`) renders an inline `.msg-tps-inline` chip in each assistant message header when enabled. Useful for power users tuning local-model setups (LM Studio, Ollama, llama.cpp, vLLM) where TPS varies turn-to-turn based on context length, parallel slots, and prompt complexity. **Backend changes:** `api/metering.py` adds explicit `tps_available` field (boolean — strict, requires both real exact token count AND backend-measured turn duration), drops placeholder `0.0` TPS when no real reading exists, switches live counting from character-count-derived text length to streaming-callback deltas. Final `_turnTps` computed from exact final output token usage divided by backend-measured turn duration when both available, persisted on assistant message and sent in `done` payload only when both signals available. **Hot-apply:** Preferences autosave updates `window._showTps` global, clears the message render cache, and re-renders messages — toggling the setting reflects in open tabs without refresh. UI evidence under `docs/pr-media/1640/` showing default-off transcript, hot-apply with TPS visible, and the Settings → Preferences toggle.
+
+- **Operator-level config knob for first-turn session save timing** (#1648 by @Michaelyklam, closes #1406) — operators wanting crash-resilience for the user's first prompt (vs accepting the first prompt being in-memory-only until streaming begins) now have a `webui.session_save_mode` config.yaml knob with values `deferred` (default — preserves the v0.50.230 fix for #1171 orphan-Untitled files) and `eager`. **Eager mode** materializes the user message into `s.messages` before launching the agent thread, plus updates `_apply_core_sync_or_error_marker` (WAL/repair path) and the streaming-thread context-build path (`_drop_checkpointed_current_user_from_context`) to avoid double-counting the user turn. Implementation matches @nesquena-hermes's prescribed shape from #1406's maintainer comment 1:1 — no Settings UI toggle (operator-level only), default stays deferred (orphan-Untitled hygiene preserved), threshold is "≥1 user message" not "did `new_session()` get called" (so empty-new-chat-then-switch-away doesn't recreate the orphan-file class). Validated `_WEBUI_SESSION_SAVE_MODES = {"deferred", "eager"}`; unknown values fail closed to `deferred`. 132-LOC test file covering both modes + WAL/repair interaction + duplicate-context filtering.
+
+- **In-app OAuth onboarding flow for OpenAI Codex** (#1650 by @Michaelyklam, refs #1362) — three new endpoints: `POST /api/onboarding/oauth/start` (initiates the device-code flow), `GET /api/onboarding/oauth/poll?flow_id=...` (returns high-level status: `pending|success|expired|cancelled|error`), `POST /api/onboarding/oauth/cancel` (aborts an in-flight flow). **Server-owned lifecycle:** all sensitive provider state (device_auth_id, code_verifier, authorization_code, access_token, refresh_token, token_data) lives in a process-local `_OAUTH_FLOWS` dict keyed by an opaque WebUI-local `flow_id` (UUID4). Browser only sees `flow_id`, `user_code`, `verification_uri`, status — never raw OAuth lifecycle secrets. 15-minute flow timeout. **Token persistence:** successful Codex credentials write to the **active profile's** `auth.json` `credential_pool.openai-codex` (atomic tmp+rename, chmod 0o600 on tmp BEFORE rename so final file never has world-readable window, defense-in-depth post-rename chmod). Allowlist `_ALLOWED_ONBOARDING_OAUTH_PROVIDERS = {"openai-codex"}`; explicit blocklist for anthropic/claude/nous/qwen/gemini/minimax/copilot (rejected with generic "Only OpenAI Codex OAuth is supported in WebUI onboarding right now" — no internal triage state leaked). Implementation matches @nesquena-hermes's prescribed shape from #1362's maintainer comment 1:1 (server-owned state machine, no client-side device codes, abort endpoint, profile-scoped storage, opt-in). Updated `static/onboarding.js` for the `openai-codex` OAuth-pending path with clickable verification URL, prominent user code with copy-to-clipboard, abort button. Updated Codex auth endpoints to current Hermes Agent Codex protocol: `https://auth.openai.com/api/accounts/deviceauth/usercode`, `.../api/accounts/deviceauth/token`, `.../oauth/token`. 182-LOC test file covering route shape, secret-leak prevention, allowlist, expiration, cancellation, profile-scoped credential write, frontend endpoint usage, and the unsupported-provider note copy update. **First step on the #1362 sprint roadmap** — Anthropic Claude OAuth is the planned v2.
+
+### Tests
+
+4255 → **4284 passing** (+29 regression tests across `tests/test_issue1617_tps_message_header.py` (31), `tests/test_session_save_mode.py` (~13 new + edits), `tests/test_issue1362_codex_oauth_onboarding.py` (9), plus existing test updates for context-window-persistence, preferences-autosave). 0 regressions. Full suite ~120s.
+
+### Pre-release verification
+
+- **Opus advisor on stage-296 combined diff: SHIP verdict.** All 14 verification questions cleared, with focused OAuth security audit on #1650 (in-memory flow lifecycle correct, lock not held during network IO, no flow_id leakage path, allowlist fail-closed, chmod-before-rename correctly implemented per the prior security-fix pattern, sensitive fields scrubbed on every terminal status transition, no internal triage state in error messages). Two minor follow-ups absorbed in-release per <20-LOC defensive policy:
+  - `_get_active_hermes_home()` exception fallback now logs a `logger.warning(...)` so silent profile-corruption fallback is observable in logs.
+  - Codex credential pool find-loop now accepts both `source == "manual:device_code"` (current code) AND `source == "oauth_device"` (legacy from prior Codex OAuth implementations) so users with prior creds get their entry updated in-place rather than accumulating a stale duplicate pool entry.
+- **#1640 has @aronprins UX-gate APPROVED** (May 04 19:24 UTC) after a tighten request landed (default-off setting + Settings → Preferences toggle, hot-applied without refresh).
+- **#1648 implements @nesquena-hermes's prescribed shape** from the #1406 maintainer comment 1:1.
+- **#1650 implements @nesquena-hermes's prescribed shape** from the #1362 maintainer comment 1:1, with explicit security-audit alignment (server-owned device codes, opaque flow_id, profile-scoped storage, blocklist for known-OAuth providers awaiting v2).
+- **JS syntax**: 5 modified `.js` files (`boot.js`, `messages.js`, `onboarding.js`, `panels.js`, `ui.js`) clean.
+- **Browser API sanity**: 11/11 endpoints OK on stage server.
+- **Conflict resolution**: clean auto-merge across all 3 PRs (rebased #1640 onto current master from 10-commits-behind base; #1648 + #1650 already on current master; no overlapping code regions across the 3 PRs in `api/streaming.py`, `api/routes.py`, or `static/`).
+
+### Authors
+
+- @Michaelyklam — 3 PRs (#1640, #1648, #1650)
+
+@Michaelyklam continues the strong contribution pattern from #1597, #1598, #1600, #1601, #1621, #1637 — this is now 9 merged PRs across the v0.50.292-296 release window.
+
+### Trust boundary note
+
+This release ships the first user-facing OAuth flow in the WebUI. Token storage path, atomic write semantics, chmod timing, server-side flow state, and the allowlist/blocklist pattern are all in scope for security reviewers reviewing v0.50.296. The Hermes Agent CLI's `auth.json` format is the source-of-truth contract — both the WebUI and CLI write the same `credential_pool.openai-codex` shape, so credentials added via either surface are usable by either surface.
+
+## [v0.50.295] — 2026-05-04
+
+### Fixed (3 PRs — closes #1360, #1451, #1463, #1618, #1619)
+
+- **YAML, JSON, and diff/patch fenced code blocks now render multi-line, not collapsed to a single line** (#1642 by @nesquena-hermes, closes #1618 / #1463, reported by @Zixim) — PR #484 (v0.50.237) introduced a JSON/YAML tree-viewer that routes `lang === 'json'` and `lang === 'yaml'` blocks through `<div class="code-tree-wrap">…<pre class="tree-raw-view">…</pre></div>` instead of bare `<pre>`. Same release added the diff/patch coloring path that emits `<pre class="diff-block">`. The `_pre_stash` regex at `static/ui.js:1914` matched only literal `<pre>` (no attributes): `<pre>[\s\S]*?<\/pre>`. Both new shapes failed to match, fell through to the paragraph-wrap pass, and `\n` characters inside the code blocks got replaced with `<br>` tags inside `<code>`. By the time Prism ran, there were no newlines left for it to highlight against. PR #1516 (v0.50.279) had attempted a CSS-only fix on Prism's token white-space — that rule is in `style.css` and reaches the browser, but it was the wrong layer: the rule preserves newlines inside `.token` spans, but the spans were built from a string that had no newlines left. **Fix:** relax the `_pre_stash` regex to accept any attribute on `<pre>` (`<pre>` → `<pre[^>]*>`). One regex character. Pulls JSON, YAML, AND diff/patch blocks into the stash so paragraph-wrap can't mangle them. Bash, Python, Go, etc. were never affected because they emit bare `<pre>` and matched the existing regex. Reporter @Zixim noted the bug persisted from v0.50.279 → v0.50.291 → v0.50.292 despite the previous "fix"; this lands the actual fix at the actual layer.
+
+  > **Parallel-discovery attribution:** @Michaelyklam independently filed PR #1641 with the exact same one-character regex relax (filed 4 minutes before #1642). #1641 was closed as superseded by #1642 (which carries nesquena APPROVED + 322 LOC test suite covering YAML+JSON+diff vs #1641's YAML-only); the UI before/after PNGs from #1641 were adopted into stage-295 with a `Co-authored-by: Michael Lam` trailer on the docs commit so Michael's visual evidence ships in-tree alongside the canonical fix.
+
+  > **Note on the previous diagnosis:** the maintainer comment on #1618 asserting the fix had landed was based on `git show v0.50.291:static/style.css` confirming the CSS rule's presence — but a presence check on a rule is not a behavioral check that the rule does anything useful. Live-rendering YAML through `renderMd()` in the browser was the test that decided whether the maintainer reply or the user was correct. Apologies to @Zixim for the wrong call. Class of bug now documented in `webui-rendermd-pipeline` skill § Bug 10.
+
+- **macOS WKWebView trackpad scroll no longer overrides user position during streaming** (#1639 by @bergeouss, closes #1360) — during streaming, scrolling up on a macOS trackpad caused the viewport to snap back to the bottom because the `_programmaticScroll setTimeout(0)` guard raced with WKWebView momentum scrolling. Mid-momentum scroll events either got swallowed (`_programmaticScroll` still True from the most recent programmatic scroll) or falsely reported nearBottom (momentum hadn't settled), keeping `_scrollPinned=true`. **Fix:** rAF-debounce the scroll listener so the nearBottom check fires on the next paint frame when the browser's scroll position has settled, plus a hysteresis counter requiring two consecutive near-bottom samples before re-pinning to prevent accidental re-pin during initial deceleration.
+
+- **Custom:* providers now show all models in the dropdown** (#1639 by @bergeouss, closes #1619) — using a `custom:*` provider via `custom_providers` in `config.yaml`, the model dropdown was only showing the default model. Two parts: (1) the dedup logic in `api/config.py` ate all named-group models when they overlapped with auto-detected ones and the `continue` silently dropped auto-detected models; (2) the live enrichment endpoint at `api/routes.py:/api/models/live` only handled bare `custom`, not `custom:*` slugs. **Fix:** broadened `/api/models/live` to handle `custom:*` slugs (load-bearing fix), plus defensive belt-and-braces in `api/config.py` to fall back to auto-detected models if all named-group models were deduped (Opus advisor on stage-295 verified the latter is unreachable under current population logic but kept for future-proofing).
+
+- **Glued-bold-heading lift no longer mangles raw `<pre>` HTML** (#1637 by @Michaelyklam, closes #1451) — `renderMd()` already stashed raw `<pre>` blocks before converting safe HTML tags, but restored them BEFORE the glued-bold-heading lift from #1446/#1449 ran. That left literal raw `<pre>` content visible to later markdown rewrites whenever it contained `Para text.**Heading**\n\nNext`-style text — the lift would insert `\n\n` inside the literal preformatted content, mangling it. **Fix:** delayed `rawPreStash` restore until AFTER markdown/link rewrites and BEFORE HTML sanitization. Existing placeholder pattern already protects fenced blocks; raw `<pre>` HTML now behaves like fenced code for this edge case. Test pins both sides: raw `<pre>` is preserved AND regular glued headings outside preformatted blocks still lift correctly.
+
+### Tests
+
+4245 → **4255 passing** (+10 regression tests across `tests/test_issue1618_yaml_json_diff_newline_preserve.py` (9), `tests/test_issue1446_glued_heading_lift.py::test_real_renderer_protects_raw_pre_html` (1); plus `tests/test_issue677.py` widened search window for #1639's rAF-debounce; plus `tests/test_745_code_block_newlines.py` widened source-scan windows from 400 to 1500 chars). 0 regressions. Full suite ~120s.
+
+### Pre-release verification
+
+- **Opus advisor on stage-295 combined diff: SHIP verdict.** All 6 verification questions cleared. `static/ui.js` overlap between #1637 (rawPreStash, R-token), #1639 (scroll listener), and #1642 (_pre_stash, E-token) verified non-overlapping with separate token namespaces and correct ordering. #1637's relocated restore (line 1668 → 1799) traced through every intermediate rewrite pass — placeholder `\x00R{N}\x00` has no syntactic characters that match. #1642 nested-`<pre>` non-greedy behavior verified identical to existing `rawPreStash` regex (no regression). #1639 hysteresis correct shape (count≥2 to re-pin). One non-blocking `api/config.py` defensive-dead-code observation absorbed via comment per Opus.
+- **#1642 has nesquena APPROVED** with comprehensive end-to-end behavioral trace.
+- **JS syntax**: `static/ui.js` clean.
+- **Browser API sanity**: 11/11 endpoints OK on stage server.
+- **Conflict resolution**: clean auto-merge across 3 PRs (rebased #1637 + #1639 onto current master from 9-commits-behind base).
+
+### Authors
+
+- @nesquena-hermes — 1 PR (#1642, with co-author trailer for @Michaelyklam's UI media adoption)
+- @Michaelyklam — 1 PR (#1637)
+- @bergeouss — 1 PR (#1639, AI-assisted via Hermes Agent)
+
+Closes #1360, #1451, #1463, #1618, #1619 (5 issues).
+
 ## [v0.50.294] — 2026-05-04
 
 ### Fixed (3 PRs — streaming stability trio + models cache version stamp + session race + readonly fs guard — closes #1430, #1470, #1623, #1624, #1625, #1633)

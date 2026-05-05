@@ -12,6 +12,7 @@ import queue
 import re
 import platform
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -19,6 +20,7 @@ import time
 import uuid
 import re
 from pathlib import Path
+from contextlib import closing
 from urllib.parse import parse_qs
 from api.agent_sessions import MESSAGING_SOURCES
 
@@ -392,6 +394,7 @@ from api.config import (
     set_reasoning_display,
     set_reasoning_effort,
     create_stream_channel,
+    get_webui_session_save_mode,
 )
 from api.helpers import (
     require,
@@ -1221,6 +1224,7 @@ from api.models import (
     title_from,
     _write_session_index,
     SESSION_INDEX_FILE,
+    _active_state_db_path,
     load_projects,
     save_projects,
     import_cli_session,
@@ -1251,6 +1255,11 @@ from api.onboarding import (
     get_onboarding_status,
     complete_onboarding,
     probe_provider_endpoint,
+)
+from api.oauth import (
+    cancel_onboarding_oauth_flow,
+    poll_onboarding_oauth_flow,
+    start_onboarding_oauth_flow,
 )
 
 # Approval system (optional -- graceful fallback if agent not available)
@@ -1652,6 +1661,135 @@ def _handle_insights(handler, parsed) -> bool:
 # ── GET routes ────────────────────────────────────────────────────────────────
 
 
+def _accept_loop_health(handler) -> dict:
+    server = getattr(handler, "server", None)
+    return {
+        "requests_total": int(getattr(server, "accept_loop_requests_total", 0) or 0),
+        "last_request_at": round(float(getattr(server, "accept_loop_last_request_at", 0.0) or 0.0), 3),
+    }
+
+
+def _streams_lock_health(timeout_seconds: float = 0.5) -> dict:
+    t0 = time.time()
+    acquired = STREAMS_LOCK.acquire(timeout=timeout_seconds)
+    elapsed_ms = round((time.time() - t0) * 1000, 1)
+    if not acquired:
+        return {
+            "status": "blocked",
+            "timeout_seconds": timeout_seconds,
+            "ms": elapsed_ms,
+        }
+    try:
+        return {
+            "status": "ok",
+            "active_streams": len(STREAMS),
+            "ms": elapsed_ms,
+        }
+    finally:
+        STREAMS_LOCK.release()
+
+
+def _deep_health_checks(stream_check: dict | None = None) -> tuple[dict, bool]:
+    """Run cheap probes that exercise the state paths used by the UI shell.
+
+    Plain /health intentionally stays tiny. /health?deep=1 is for supervisors
+    and watchdogs that need to know whether the process can still touch the
+    shared stream map, sidebar/session path, project state, and Hermes state.db
+    without hitting the RST-before-write failure mode from #1458.
+
+    `stream_check` is the result from a prior `_streams_lock_health()` call;
+    if provided, it's reused so we don't acquire `STREAMS_LOCK` twice on the
+    same /health?deep=1 request (per Opus advisor on stage-297).
+    """
+    checks: dict[str, dict] = {}
+
+    checks["streams_lock"] = stream_check if stream_check is not None else _streams_lock_health()
+    if checks["streams_lock"].get("status") != "ok":
+        return checks, False
+
+    t0 = time.time()
+    try:
+        sessions = all_sessions()
+        checks["sessions"] = {
+            "status": "ok",
+            "count": len(sessions),
+            "ms": round((time.time() - t0) * 1000, 1),
+        }
+    except Exception as exc:
+        checks["sessions"] = {
+            "status": "error",
+            "error": type(exc).__name__,
+            "ms": round((time.time() - t0) * 1000, 1),
+        }
+
+    t0 = time.time()
+    try:
+        projects = load_projects(_migrate=False)
+        checks["projects"] = {
+            "status": "ok",
+            "count": len(projects),
+            "ms": round((time.time() - t0) * 1000, 1),
+        }
+    except Exception as exc:
+        checks["projects"] = {
+            "status": "error",
+            "error": type(exc).__name__,
+            "ms": round((time.time() - t0) * 1000, 1),
+        }
+
+    t0 = time.time()
+    try:
+        db_path = _active_state_db_path()
+        if not db_path.exists():
+            checks["state_db"] = {
+                "status": "missing",
+                "ms": round((time.time() - t0) * 1000, 1),
+            }
+        else:
+            with closing(sqlite3.connect(str(db_path))) as conn:
+                conn.execute("PRAGMA schema_version").fetchone()
+            checks["state_db"] = {
+                "status": "ok",
+                "ms": round((time.time() - t0) * 1000, 1),
+            }
+    except Exception as exc:
+        checks["state_db"] = {
+            "status": "error",
+            "error": type(exc).__name__,
+            "ms": round((time.time() - t0) * 1000, 1),
+        }
+
+    healthy = all(
+        check.get("status") in {"ok", "missing"}
+        for check in checks.values()
+    )
+    return checks, healthy
+
+
+def _handle_health(handler, parsed):
+    deep = parse_qs(parsed.query or "").get("deep", [""])[0].lower() in {"1", "true", "yes", "on"}
+    stream_check = _streams_lock_health()
+    payload = {
+        "status": "ok" if stream_check.get("status") == "ok" else "degraded",
+        "sessions": len(SESSIONS),
+        "active_streams": int(stream_check.get("active_streams") or 0),
+        "uptime_seconds": round(time.time() - SERVER_START_TIME, 1),
+        "accept_loop": _accept_loop_health(handler),
+    }
+    if deep:
+        if stream_check.get("status") != "ok":
+            payload["checks"] = {"streams_lock": stream_check}
+            return j(handler, payload, status=503)
+        checks, healthy = _deep_health_checks(stream_check=stream_check)
+        payload["checks"] = checks
+        if not healthy:
+            payload["status"] = "degraded"
+            return j(handler, payload, status=503)
+    if payload["status"] != "ok":
+        return j(handler, payload, status=503)
+    return j(handler, payload)
+
+
 def handle_get(handler, parsed) -> bool:
     """Handle all GET routes. Returns True if handled, False for 404."""
 
@@ -1770,17 +1908,7 @@ def handle_get(handler, parsed) -> bool:
         return _handle_insights(handler, parsed)
 
     if parsed.path == "/health":
-        with STREAMS_LOCK:
-            n_streams = len(STREAMS)
-        return j(
-            handler,
-            {
-                "status": "ok",
-                "sessions": len(SESSIONS),
-                "active_streams": n_streams,
-                "uptime_seconds": round(time.time() - SERVER_START_TIME, 1),
-            },
-        )
+        return _handle_health(handler, parsed)
 
     if parsed.path == "/api/models":
         return j(handler, get_available_models())
@@ -2279,38 +2407,19 @@ def handle_get(handler, parsed) -> bool:
             return j(handler, {"error": "not found"}, status=404)
         return _handle_clarify_inject(handler, parsed)
 
-    # ── OAuth (Codex device-code) ──
-    if parsed.path == "/api/oauth/codex/start":
-        """Start Codex device-code OAuth flow. Returns user_code + verification_uri."""
-        try:
-            from api.oauth import start_codex_device_code
-            result = start_codex_device_code()
-            return j(handler, result)
-        except Exception as e:
-            return j(handler, {"error": str(e)}, status=500)
-
-    if parsed.path == "/api/oauth/codex/poll":
-        """SSE endpoint for polling Codex OAuth token."""
+    if parsed.path == "/api/onboarding/oauth/poll":
         qs = parse_qs(parsed.query)
-        device_code = qs.get("device_code", [""])[0]
-        if not device_code:
-            return j(handler, {"error": "device_code required"}, status=400)
-        handler.send_response(200)
-        handler.send_header("Content-Type", "text/event-stream")
-        handler.send_header("Cache-Control", "no-cache")
-        handler.send_header("Connection", "keep-alive")
-        handler.end_headers()
+        flow_id = qs.get("flow_id", [""])[0]
         try:
-            from api.oauth import poll_codex_token
-            for event in poll_codex_token(device_code):
-                handler.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
-                handler.wfile.flush()
-                if event.get("status") in ("success", "error"):
-                    break
-        except Exception as e:
-            handler.wfile.write(f"data: {json.dumps({'status': 'error', 'error': str(e)})}\n\n".encode())
-            handler.wfile.flush()
-        return  # SSE handled, no JSON response
+            return j(
+                handler,
+                poll_onboarding_oauth_flow(flow_id),
+                extra_headers={"Cache-Control": "no-store"},
+            )
+        except ValueError as e:
+            return bad(handler, str(e))
+        except KeyError as e:
+            return bad(handler, str(e), 404)
 
     # ── Cron API (GET) ──
     # All cron handlers touch cron.jobs which resolves HERMES_HOME from
@@ -3279,6 +3388,34 @@ def handle_post(handler, parsed) -> bool:
         handler.end_headers()
         handler.wfile.write(response_body)
         return True
+
+    if parsed.path == "/api/onboarding/oauth/start":
+        from api.auth import is_auth_enabled
+        import os as _os
+        if not is_auth_enabled() and not _os.getenv("HERMES_WEBUI_ONBOARDING_OPEN"):
+            import ipaddress
+            try:
+                _xff = handler.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+                _xri = handler.headers.get("X-Real-IP", "").strip()
+                _raw = handler.client_address[0]
+                addr = ipaddress.ip_address(_xff or _xri or _raw)
+                is_local = addr.is_loopback or addr.is_private
+            except ValueError:
+                is_local = False
+            if not is_local:
+                return bad(handler, "Onboarding OAuth is only available from local networks when auth is not enabled. To bypass this on a remote server, set HERMES_WEBUI_ONBOARDING_OPEN=1.", 403)
+        try:
+            return j(handler, start_onboarding_oauth_flow(body), extra_headers={"Cache-Control": "no-store"})
+        except ValueError as e:
+            return bad(handler, str(e))
+        except RuntimeError as e:
+            return bad(handler, str(e), 500)
+
+    if parsed.path == "/api/onboarding/oauth/cancel":
+        try:
+            return j(handler, cancel_onboarding_oauth_flow(body), extra_headers={"Cache-Control": "no-store"})
+        except ValueError as e:
+            return bad(handler, str(e))
 
     if parsed.path == "/api/onboarding/setup":
         # Writing API keys to disk - restrict to local/private networks unless auth is active.
@@ -4523,11 +4660,12 @@ def _handle_live_models(handler, parsed):
             ids = []
 
         if not ids:
-            # For 'custom' provider, provider_model_ids() returns [] because
-            # 'custom' isn't a real endpoint.  Fall back to the custom_providers
-            # entries from config.yaml so the live-model enrichment step can
-            # add any models that weren't already in the static list.
-            if provider == "custom":
+            # For 'custom' and 'custom:*' providers, provider_model_ids()
+            # returns [] because they aren't real hermes_cli endpoints.
+            # Fall back to the custom_providers entries from config.yaml so
+            # the live-model enrichment step can add any models that weren't
+            # already in the static list (issue #1619).
+            if provider == "custom" or provider.startswith("custom:"):
                 try:
                     _cp_entries = cfg.get("custom_providers", [])
                     if isinstance(_cp_entries, list):
@@ -4539,8 +4677,8 @@ def _handle_live_models(handler, parsed):
                 except Exception:
                     pass
             
-            # If still no ids, try fetching from model.base_url directly (OpenAI-compat endpoint)
-            if not ids and provider == "custom":
+            # If still no ids, try fetching from base_url directly (OpenAI-compat endpoint)
+            if not ids and (provider == "custom" or provider.startswith("custom:")):
                 _base_url = cfg.get("model", {}).get("base_url")
                 _api_key = cfg.get("model", {}).get("api_key")
                 if _base_url and _api_key:
@@ -5055,6 +5193,68 @@ def _handle_background(handler, body):
     return j(handler, {"task_id": task_id, "stream_id": stream_id, "session_id": bg.session_id})
 
 
+def _checkpoint_user_message_for_eager_session_save(s, msg: str, attachments, started_at: float | None) -> None:
+    """Materialize the current user turn for eager first-turn persistence.
+
+    The streaming thread still receives ``pending_user_message`` so existing
+    cancel/recovery/final-merge paths keep their current contract. Eager mode
+    only adds a durable display-message checkpoint before the agent launches.
+    """
+    if not msg:
+        return
+    existing = list(getattr(s, "messages", None) or [])
+    if existing:
+        latest = existing[-1]
+        if isinstance(latest, dict) and latest.get("role") == "user":
+            latest_text = " ".join(str(latest.get("content") or "").split())
+            msg_text = " ".join(str(msg or "").split())
+            if latest_text == msg_text:
+                return
+    user_msg = {"role": "user", "content": msg}
+    if isinstance(started_at, (int, float)) and started_at > 0:
+        user_msg["timestamp"] = int(started_at)
+    if attachments:
+        user_msg["attachments"] = list(attachments)
+    s.messages.append(user_msg)
+
+
+def _prepare_chat_start_session_for_stream(
+    s,
+    *,
+    msg: str,
+    attachments,
+    workspace: str,
+    model: str,
+    model_provider,
+    stream_id: str,
+    started_at: float | None = None,
+):
+    """Persist chat-start state according to webui.session_save_mode.
+
+    ``deferred`` keeps the existing sidecar/WAL-backed behaviour: save pending
+    fields but leave the display transcript empty until the agent merges the
+    result. ``eager`` additionally writes the current user turn into messages so
+    a process restart immediately after /api/chat/start preserves the prompt as
+    a normal session message. Empty sessions are never saved here because this
+    helper only runs after a non-empty message is validated.
+    """
+    s.workspace = workspace
+    s.model = model
+    s.model_provider = model_provider
+    s.active_stream_id = stream_id
+    s.pending_user_message = msg
+    s.pending_attachments = attachments
+    s.pending_started_at = started_at if started_at is not None else time.time()
+    if get_webui_session_save_mode() == "eager":
+        _checkpoint_user_message_for_eager_session_save(
+            s,
+            msg,
+            attachments,
+            s.pending_started_at,
+        )
+    s.save()
+
+
 def _handle_chat_start(handler, body):
     try:
         require(body, "session_id")
@@ -5102,14 +5302,15 @@ def _handle_chat_start(handler, body):
         _clear_stale_stream_state(s)
     stream_id = uuid.uuid4().hex
     with _get_session_agent_lock(s.session_id):
-        s.workspace = workspace
-        s.model = model
-        s.model_provider = model_provider
-        s.active_stream_id = stream_id
-        s.pending_user_message = msg
-        s.pending_attachments = attachments
-        s.pending_started_at = time.time()
-        s.save()
+        _prepare_chat_start_session_for_stream(
+            s,
+            msg=msg,
+            attachments=attachments,
+            workspace=workspace,
+            model=model,
+            model_provider=model_provider,
+            stream_id=stream_id,
+        )
     set_last_workspace(workspace)
     stream = create_stream_channel()
     with STREAMS_LOCK:
